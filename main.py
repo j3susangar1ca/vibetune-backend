@@ -25,7 +25,7 @@ import asyncio
 import functools
 import tempfile
 import unicodedata
-import httpx  # <--- ESTA ES LA QUE FALTA Y CAUSA EL ERROR
+import httpx
 from datetime import datetime, timezone, timedelta
 from dataclasses import dataclass
 from typing import Optional, Tuple, Literal
@@ -355,16 +355,22 @@ def _validate_yt_dlp_version():
 
 _validate_yt_dlp_version()
 
-# Configuración base de yt-dlp con cookies locales y extracción Android.
+# Configuración base de yt-dlp con extracción Android.
+# Las cookies son opcionales y deben montarse como secreto externo; nunca deben
+# versionarse dentro del repositorio.
 YDL_OPTS = {
     "quiet": True,
     "no_warnings": True,
-    "cookiefile": "auth/cookies.txt",
-    "format": "best",  # <--- Cambiamos a 'best' para que acepte cualquier formato válido
+    "format": "best",
     "extractor_args": {
         "youtube": ["player_client=android"]
     }
 }
+
+if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
+    YDL_OPTS["cookiefile"] = YT_COOKIES_FILE
+else:
+    logger.warning("yt_cookies_file_not_found_or_not_configured", cookiefile=YT_COOKIES_FILE)
 
 YTDLP_PROFILES = [
     {
