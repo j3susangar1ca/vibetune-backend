@@ -355,56 +355,27 @@ def _validate_yt_dlp_version():
 
 _validate_yt_dlp_version()
 
-# Configuración base agnóstica y limpia. Reducida a 3 reintentos rápidos.
-YTDLP_BASE_OPTS = {
-    "source_address": "0.0.0.0",       # Forzado de IPv4 nativo y seguro sin alterar CPython
-    "socket_timeout": 30,
-    "retries": 3,                      # Reducido de 10 a 3: un baneo SSL no se mitiga insistiendo en caliente
-    "fragment_retries": 3,
+# Configuración base de yt-dlp con cookies locales y extracción Android.
+YDL_OPTS = {
     "quiet": True,
     "no_warnings": True,
+    "cookiefile": "auth/cookies.txt",
+    "format": "bestaudio/best",
+    "extractor_args": {
+        "youtube": ["player_client=android"]
+    }
 }
-if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
-    YTDLP_BASE_OPTS["cookiefile"] = YT_COOKIES_FILE
 
-# Definición de Perfiles Limpios (Evita la colisión de Huellas TLS entre curl_cffi y cabeceras manuales)
 YTDLP_PROFILES = [
     {
-        "name": "Por Defecto + Impersonate Chrome",
-        "opts": {
-            **YTDLP_BASE_OPTS,
-            "impersonate": "chrome" if CURL_CFFI_AVAILABLE else None, # Calla cabeceras manuales si se imita TLS
-            "extractor_args": {"youtube": {"player_skip": ["webpage"]}}
-        }
-    },
-    {
-        "name": "Cliente iOS Nativo",
-        "opts": {
-            **YTDLP_BASE_OPTS,
-            "extractor_args": {"youtube": {"player_client": ["ios"], "player_skip": ["webpage"]}}
-        }
-    },
-    {
-        "name": "Cliente Android Nativo",
-        "opts": {
-            **YTDLP_BASE_OPTS,
-            "extractor_args": {"youtube": {"player_client": ["android"], "player_skip": ["webpage"]}}
-        }
-    },
-    {
-        "name": "Cliente Móvil Web (mweb)",
-        "opts": {
-            **YTDLP_BASE_OPTS,
-            "extractor_args": {"youtube": {"player_client": ["mweb"], "player_skip": ["webpage"]}}
-        }
+        "name": "Por Defecto + Android",
+        "opts": {**YDL_OPTS}
     }
 ]
 
 # Sanitizar diccionarios (remover valores None dinámicamente)
 for p in YTDLP_PROFILES:
     p["opts"] = {k: v for k, v in p["opts"].items() if v is not None}
-    if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
-        p["opts"]["cookiefile"] = YT_COOKIES_FILE
 
 _metadata_cache: OrderedDict[str, Tuple[dict, float]] = OrderedDict()
 _METADATA_CACHE_TTL = 3600
