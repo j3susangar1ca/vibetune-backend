@@ -66,7 +66,7 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "vibetune-tracks")
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "7200"))
 MAX_WORKERS = max(1, min((os.cpu_count() or 4), 4))
-YT_COOKIES_FILE = os.getenv("YT_COOKIES_FILE", "")
+YT_COOKIES_FILE = os.getenv("YT_COOKIES_FILE", "auth/cookies.txt")
 
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("Faltan credenciales de Supabase en el .env")
@@ -364,6 +364,8 @@ YTDLP_BASE_OPTS = {
     "quiet": True,
     "no_warnings": True,
 }
+if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE):
+    YTDLP_BASE_OPTS["cookiefile"] = YT_COOKIES_FILE
 
 # Definición de Perfiles Limpios (Evita la colisión de Huellas TLS entre curl_cffi y cabeceras manuales)
 YTDLP_PROFILES = [
