@@ -66,16 +66,16 @@ SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 BUCKET_NAME = os.getenv("BUCKET_NAME", "vibetune-tracks")
 MAX_DURATION_SECONDS = int(os.getenv("MAX_DURATION_SECONDS", "7200"))
 MAX_WORKERS = max(1, min((os.cpu_count() or 4), 4))
-YT_COOKIES_FILE = os.getenv("YT_COOKIES_FILE", "auth/cookies.txt")
+YT_COOKIES_FILE = os.getenv("YT_COOKIES_FILE", "cookies.txt")
 
-if not SUPABASE_URL or not SUPABASE_KEY:
-    raise ValueError("Faltan credenciales de Supabase en el .env")
-
-# Conexión limpia a Supabase utilizando su propio pool interno optimizado
-supabase: Client = create_client(
-    SUPABASE_URL, SUPABASE_KEY,
-    options=ClientOptions(postgrest_client_timeout=30.0, storage_client_timeout=300.0),
-)
+supabase: Optional[Client] = None
+if SUPABASE_URL and SUPABASE_KEY:
+    supabase = create_client(
+        SUPABASE_URL, SUPABASE_KEY,
+        options=ClientOptions(postgrest_client_timeout=30.0, storage_client_timeout=300.0),
+    )
+else:
+    print("Supabase no configurado; se omite la integración con Supabase.")
 
 # ═══════════════════════════════════════════════════════════════════
 # 2. OBSERVABILIDAD — Structlog + Prometheus
@@ -103,6 +103,9 @@ structlog.configure(
 )
 
 logger = structlog.get_logger()
+
+if supabase is None:
+    logger.warning("supabase_not_configured", message="Se omite la integración con Supabase porque no hay credenciales configuradas.")
 
 REQUEST_COUNT = Counter("vibetune_requests_total", "Total requests", ["method", "endpoint", "status_code"])
 REQUEST_DURATION = Histogram("vibetune_request_duration_seconds", "Request duration", ["method", "endpoint"],
@@ -433,7 +436,41 @@ async def _extract_metadata_async(url: str) -> Tuple[dict, dict]:
     # 4. Si todo falla, solo aquí lanzamos el error
     raise HTTPException(status_code=503, detail="YouTube bloqueó la IP y todos los espejos gratuitos están caídos.")
 
+def extract_direct_stream_url(youtube_url: str) -> dict:
+    ydl_opts = {
+        "cookiefile": YT_COOKIES_FILE if YT_COOKIES_FILE and os.path.exists(YT_COOKIES_FILE) else None,
+        "format": "bestaudio/best",
+        "quiet": True,
+        "no_warnings": True,
+    }
+    ydl_opts = {k: v for k, v in ydl_opts.items() if v is not None}
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(youtube_url, download=False)
+
+    if not isinstance(info, dict):
+        raise ValueError("No se pudo obtener información del video.")
+
+    audio_url = info.get("url")
+    if not audio_url:
+        for fmt in info.get("formats", []) or []:
+            if fmt.get("url") and fmt.get("vcodec") in (None, "none"):
+                audio_url = fmt["url"]
+                break
+
+    if not audio_url:
+        raise ValueError("No se pudo obtener la URL de streaming directa.")
+
+    return {
+        "status": "success",
+        "title": info.get("title") or "Pista Desconocida",
+        "stream_url": audio_url,
+    }
+
+
 async def _check_existing_track_async(video_id: str):
+    if supabase is None:
+        return type("Result", (), {"data": []})()
     return await _run_worker_async(lambda: supabase.table("audio-extractor").select("*").eq("video_id", video_id).execute())
 
 # ═══════════════════════════════════════════════════════════════════
@@ -558,17 +595,18 @@ async def lifespan(app: FastAPI):
     logger.info("iniciando_backend_vibetune", max_workers=MAX_WORKERS, curl_cffi=CURL_CFFI_AVAILABLE)
 
     # Limpieza automática de tareas huérfanas atascadas del despliegue anterior
-    try:
-        stale_threshold = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
-        stale = (
-            supabase.table("audio-extractor").select("video_id")
-            .eq("status", TrackStatus.PROCESSING).lt("updated_at", stale_threshold).execute()
-        )
-        for record in (stale.data or []):
-            fail_track(record["video_id"], "El proceso fue interrumpido por reinicio del contenedor")
-            logger.warning("tarea_huerfana_recuperada", video_id=record["video_id"])
-    except Exception as e:
-        logger.error("falla_limpieza_tareas_huerfanas", error=str(e))
+    if supabase is not None:
+        try:
+            stale_threshold = (datetime.now(timezone.utc) - timedelta(minutes=10)).isoformat()
+            stale = (
+                supabase.table("audio-extractor").select("video_id")
+                .eq("status", TrackStatus.PROCESSING).lt("updated_at", stale_threshold).execute()
+            )
+            for record in (stale.data or []):
+                fail_track(record["video_id"], "El proceso fue interrumpido por reinicio del contenedor")
+                logger.warning("tarea_huerfana_recuperada", video_id=record["video_id"])
+        except Exception as e:
+            logger.error("falla_limpieza_tareas_huerfanas", error=str(e))
 
     yield
 
@@ -637,11 +675,14 @@ async def root():
 @app.get("/health")
 async def health_check():
     checks = {}
-    try:
-        await _run_worker_async(lambda: supabase.table("audio-extractor").select("video_id").limit(1).execute())
-        checks["supabase"] = "healthy"
-    except Exception:
+    if supabase is None:
         checks["supabase"] = "unhealthy"
+    else:
+        try:
+            await _run_worker_async(lambda: supabase.table("audio-extractor").select("video_id").limit(1).execute())
+            checks["supabase"] = "healthy"
+        except Exception:
+            checks["supabase"] = "unhealthy"
     checks["yt_dlp_version"] = yt_dlp.version.__version__
     all_healthy = checks["supabase"] == "healthy"
     return JSONResponse(status_code=200 if all_healthy else 503, content={"status": "ok" if all_healthy else "degraded", "checks": checks})
@@ -657,65 +698,15 @@ async def convert_track(request: Request, url: str = Query(..., description="Enl
     url_result = canonicalize_youtube_url(url)
     if url_result is None:
         raise HTTPException(status_code=400, detail="URL de YouTube inválida.")
-    canonical_url, video_id = url_result
+    canonical_url, _ = url_result
 
-    # 1. Comprobación veloz en base de datos
     try:
-        existing = await _check_existing_track_async(video_id)
-    except Exception as e:
-        log.error("error_consulta_db", video_id=video_id, error=str(e))
-        raise HTTPException(status_code=500, detail="Error al consultar la base de datos.")
+        result = extract_direct_stream_url(canonical_url)
+    except Exception as exc:
+        log.error("error_extraccion_stream_url", error=str(exc), exc_info=True)
+        raise HTTPException(status_code=502, detail="No se pudo obtener la URL de streaming directa.")
 
-    if existing.data:
-        record = existing.data[0]
-        if record.get("status") == TrackStatus.COMPLETED:
-            return TrackResponse(**record, status=TrackStatus.COMPLETED)
-        return JSONResponse(status_code=202, content=TrackResponse(
-            video_id=video_id, titulo_limpio=record.get("titulo_limpio", ""),
-            artista_principal=record.get("artista_principal", ""), stream_url=None,
-            duracion_segundos=record.get("duracion_segundos", 0),
-            status=record.get("status", TrackStatus.PROCESSING),
-        ).model_dump(), headers={"Location": f"/api/status/{video_id}", "Retry-After": "3"})
-
-    # 2. Extracción adaptativa (Fase Crítica)
-    meta, successful_opts = await _extract_metadata_async(canonical_url)
-    
-    raw_title = str(meta.get("title", "Pista Desconocida"))
-    uploader = str(meta.get("uploader", "Artista"))
-    duration = int(meta.get("duration", 0))
-
-    if duration > MAX_DURATION_SECONDS:
-        raise HTTPException(status_code=400, detail=f"El video excede la duración máxima permitida.")
-
-    cleaner = get_metadata_cleaner()
-    track_meta = cleaner.clean(raw_title, uploader)
-
-    # 3. Claim Atómico con exclusión de hilos mutuos
-    if not claim_track(video_id, track_meta.title, track_meta.artist, duration):
-        return JSONResponse(status_code=202, content=TrackResponse(
-            video_id=video_id, titulo_limpio=track_meta.title, artista_principal=track_meta.artist,
-            stream_url=None, duracion_segundos=duration, status=TrackStatus.PROCESSING,
-        ).model_dump(), headers={"Location": f"/api/status/{video_id}", "Retry-After": "3"})
-
-    # 4. Lanzamiento de tarea asíncrona limpia
-    content_type = detect_content_type(meta)
-    task = asyncio.create_task(
-        run_worker_async(canonical_url, video_id, track_meta.title, track_meta.artist, duration, content_type, successful_opts),
-        name=f"download-{video_id}",
-    )
-    app.state.active_tasks.add(task)
-    
-    # Callback de limpieza blindado
-    def clean_task_callback(t):
-        app.state.active_tasks.discard(t)
-        
-    task.add_done_callback(clean_task_callback)
-    log.info("tarea_descarga_registrada", video_id=video_id)
-
-    return JSONResponse(status_code=202, content=TrackResponse(
-        video_id=video_id, titulo_limpio=track_meta.title, artista_principal=track_meta.artist,
-        stream_url=None, duracion_segundos=duration, status=TrackStatus.PROCESSING,
-    ).model_dump(), headers={"Location": f"/api/status/{video_id}", "Retry-After": "3"})
+    return JSONResponse(status_code=200, content=result)
 
 @app.get("/api/status/{video_id}")
 async def get_status(video_id: str):
