@@ -360,7 +360,7 @@ YDL_OPTS = {
     "quiet": True,
     "no_warnings": True,
     "cookiefile": "auth/cookies.txt",
-    "format": "bestaudio/best",
+    "format": "best",  # <--- Cambiamos a 'best' para que acepte cualquier formato válido
     "extractor_args": {
         "youtube": ["player_client=android"]
     }
